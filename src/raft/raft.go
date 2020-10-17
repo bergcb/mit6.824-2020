@@ -18,8 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
-	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -108,6 +106,7 @@ func (rf *Raft) becomeFollower(term int) {
 	//defer rf.mu.Unlock()
 	rf.role = FOLLOWER
 	rf.currentTerm = term
+	rf.leaderID = -1
 	rf.votedFor = -1
 	rf.persist()
 	//rf.electionTimer.Reset(getRandElectTimeout())
@@ -266,8 +265,10 @@ func (rf *Raft) runCandidate() {
 		return
 	}
 	if votes >= len(rf.peers)/2+1 {
-		println("received majority votes!")
+		//println("received majority votes!")
 		rf.becomeLeader()
+		rf.mu.Unlock()
+		return
 		//rf.currentTerm = term
 	} else {
 		//println("lost")
@@ -468,16 +469,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electWaitDuration = 300
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 1
-	rf.votedFor = -1
+	rf.becomeFollower(1)
+	//rf.currentTerm = 1
+	//rf.votedFor = -1
+	//rf.leaderID = -1
 	rf.MinWaitTime = 150
 	rf.MaxWaitTime = 300
-	rf.leaderID = -1
 
 	rf.commitIndex = -1
 	rf.lastApplied = -1
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
+	//rf.nextIndex = make([]int, len(rf.peers))
+	//rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -502,8 +504,8 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) sendAppendEntries(peerIndex int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	go func() {
-		sendBegin := time.Now()
-		ok := rf.peers[peerIndex].Call("Raft.AppendEntries", args, reply)
+		//sendBegin := time.Now()
+		rf.peers[peerIndex].Call("Raft.AppendEntries", args, reply)
 
 		//如果其他server的currentTerm 大于 leader，要把leader设置位follower
 		rf.mu.Lock()
@@ -512,8 +514,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, args *AppendEntriesArgs, reply 
 		}
 		rf.mu.Unlock()
 
-		sendEnd := time.Now()
-		fmt.Println("resp", ok, "heartbeat response from peer", peerIndex, "received in", sendEnd.Sub(sendBegin), "success", reply.Success)
+		//sendEnd := time.Now()
+		//log.Println("resp", ok, "heartbeat response from peer", peerIndex, "received in", sendEnd.Sub(sendBegin), "success", reply.Success)
 	}()
 
 }
@@ -551,11 +553,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//rf.currentTerm =
 		reply.Success = true
 		rf.lastVoteOrRecvAppendEntryTime = time.Now()
+		//log.Println(rf.me, "receive ae at" ,rf.lastVoteOrRecvAppendEntryTime)
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 	}
-	log.Println(args.LeaderId, "in term", args.Term, "send append entry to ", rf.me)
+	//log.Println(args.LeaderId, "in term", args.Term, "send append entry to ", rf.me)
 	return
 }
 
@@ -582,10 +585,10 @@ func (rf *Raft) runFollower() {
 		randNum := rf.randNum()
 		dt := rf.lastVoteOrRecvAppendEntryTime.Add(time.Millisecond * time.Duration(randNum))
 		if time.Now().After(dt) {
-			fmt.Println(rf.me, "in term", rf.currentTerm, "did not receive heartbeat signal from supposed leader peer", "in", randNum, "ms, converting to a candidate")
-			rf.role = CANDIDATE
-			//rf.becomeCandidate()
-
+			//fmt.Println(rf.lastVoteOrRecvAppendEntryTime, randNum)
+			//fmt.Println(rf.me, "in term", rf.currentTerm, "did not receive heartbeat signal from supposed leader peer", "in", randNum, "ms, converting to a candidate")
+			//rf.role = CANDIDATE
+			rf.becomeCandidate()
 			rf.mu.Unlock()
 			return
 		}
