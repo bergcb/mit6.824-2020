@@ -3,10 +3,11 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"log"
 	"../raft"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -18,11 +19,27 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	GET    = 0
+	PUT    = 1
+	APPEND = 2
+)
 
 type Op struct {
+	Type      string
+	Key       string
+	Value     string
+	RequestId int
+	ClientId  int64
+
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+}
+
+type Notification struct {
+	ClientId  int64
+	RequestId int
 }
 
 type KVServer struct {
@@ -31,19 +48,110 @@ type KVServer struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
+	log     map[int]bool
+
+	storage            map[string]string
+	dispatcher         map[int]chan Notification
+	waitTime           time.Duration
+	lastApplyRequestId map[int64]int
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
 }
 
+//每个请求都有一个channel, waitApply会从这个channel中获得apply后的结果，
+func (kv *KVServer) callRaftAndStorage(op Op) Err {
+	//println("to start", op.ClientId, op.RequestId, op.Value, op.Key, op.Type)
+	index, _, isLeader := kv.rf.Start(op)
+	var err Err
+	err = ErrWrongLeader
+
+	if !isLeader {
+		return ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	kv.dispatcher[index] = make(chan Notification, 1)
+	ch := kv.dispatcher[index]
+	kv.mu.Unlock()
+
+	select {
+	case notify := <-ch:
+		if notify.RequestId != op.RequestId || notify.ClientId != op.ClientId {
+			err = ErrWrongLeader
+		} else {
+			err = OK
+		}
+	case <-time.After(kv.waitTime):
+		kv.mu.Lock()
+		if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+			err = ErrDuplicateReq
+		} else {
+			err = ErrTimeout
+		}
+		kv.mu.Unlock()
+	}
+	kv.mu.Lock()
+	delete(kv.dispatcher, index)
+	kv.mu.Unlock()
+	return err
+}
+
+//在kv.lastApplyRequestId中记录的key ,value相等的请求，是DuplicateRequest
+//场景：网络问题，导致同一个请求重复达到server
+func (kv *KVServer) isDuplicateRequest(clientId int64, requestId int) bool {
+	lastApplyRequestId, ok := kv.lastApplyRequestId[clientId]
+	if ok == false || lastApplyRequestId != requestId {
+		return false
+	}
+	return true
+}
+
+func (kv *KVServer) dataGet(key string) (err Err, val string) {
+	if v, ok := kv.storage[key]; ok {
+		err = OK
+		val = v
+		return
+	} else {
+		err = ErrNoKey
+		return
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	op := Op{
+		Key:       args.Key,
+		Type:      "Get",
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+
+	err := kv.callRaftAndStorage(op)
+	reply.Err = err
+
+	if err == OK || err == ErrDuplicateReq {
+		kv.mu.Lock()
+		err, value := kv.dataGet(args.Key)
+		reply.Value = value
+		reply.Err = err
+		kv.mu.Unlock()
+	}
 	// Your code here.
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Type:      args.Op,
+		Value:     args.Value,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+	//println("in PA")
+
+	err := kv.callRaftAndStorage(op)
+	reply.Err = err
 }
 
 //
@@ -89,12 +197,43 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.waitTime = 500 * time.Millisecond
+
+	kv.storage = make(map[string]string)
+	kv.lastApplyRequestId = make(map[int64]int)
+	kv.dispatcher = make(map[int]chan Notification)
 
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	go func() {
+		for applyMsg := range kv.applyCh {
+			op := applyMsg.Command.(Op)
+			kv.mu.Lock()
 
+			if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+				kv.mu.Unlock()
+				continue
+			}
+			if op.Type == "Append" {
+				kv.storage[op.Key] += op.Value
+			} else if op.Type == "Put" {
+				kv.storage[op.Key] = op.Value
+			}
+			kv.lastApplyRequestId[op.ClientId] = op.RequestId
+
+			//只有leader或者认为自己是leader且接受了client的请求的server，才会在callRaftAndStorage里等待channel里的notify
+			if ch, ok := kv.dispatcher[applyMsg.CommandIndex]; ok {
+				notify := Notification{
+					ClientId:  op.ClientId,
+					RequestId: op.RequestId,
+				}
+				ch <- notify
+			}
+			kv.mu.Unlock()
+		}
+	}()
 	// You may need initialization code here.
 
 	return kv
