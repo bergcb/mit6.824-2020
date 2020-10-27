@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -18,12 +19,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-
-const (
-	GET    = 0
-	PUT    = 1
-	APPEND = 2
-)
 
 type Op struct {
 	Type      string
@@ -43,34 +38,40 @@ type Notification struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
-	log     map[int]bool
-
+	mu                 sync.Mutex
+	me                 int
+	rf                 *raft.Raft
+	applyCh            chan raft.ApplyMsg
+	dead               int32 // set by Kill()
+	log                map[int]bool
+	persister          *raft.Persister
 	storage            map[string]string
 	dispatcher         map[int]chan Notification
 	waitTime           time.Duration
 	lastApplyRequestId map[int64]int
-
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate       int // snapshot if log grows this big
 
 	// Your definitions here.
 }
 
 //每个请求都有一个channel, waitApply会从这个channel中获得apply后的结果，
 func (kv *KVServer) callRaftAndStorage(op Op) Err {
-	//println("to start", op.ClientId, op.RequestId, op.Value, op.Key, op.Type)
-	index, _, isLeader := kv.rf.Start(op)
 	var err Err
 	err = ErrWrongLeader
+
+	kv.mu.Lock()
+	if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+		err = ErrDuplicateReq
+		kv.mu.Unlock()
+		return err
+	}
+	kv.mu.Unlock()
+
+	index, _, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		return ErrWrongLeader
 	}
-
 	kv.mu.Lock()
 	kv.dispatcher[index] = make(chan Notification, 1)
 	ch := kv.dispatcher[index]
@@ -102,7 +103,7 @@ func (kv *KVServer) callRaftAndStorage(op Op) Err {
 //场景：网络问题，导致同一个请求重复达到server
 func (kv *KVServer) isDuplicateRequest(clientId int64, requestId int) bool {
 	lastApplyRequestId, ok := kv.lastApplyRequestId[clientId]
-	if ok == false || lastApplyRequestId != requestId {
+	if ok == false || lastApplyRequestId < requestId {
 		return false
 	}
 	return true
@@ -126,7 +127,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		RequestId: args.RequestId,
 		ClientId:  args.ClientId,
 	}
-
 	err := kv.callRaftAndStorage(op)
 	reply.Err = err
 
@@ -148,8 +148,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		RequestId: args.RequestId,
 		ClientId:  args.ClientId,
 	}
-	//println("in PA")
-
 	err := kv.callRaftAndStorage(op)
 	reply.Err = err
 }
@@ -175,6 +173,43 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) genSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.storage)
+	e.Encode(kv.lastApplyRequestId)
+	kv.mu.Unlock()
+
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) saveSnapshot(lastSnapshotIndex int) {
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	snapshot := kv.genSnapshot()
+	go kv.rf.SaveSnapshot(snapshot, lastSnapshotIndex)
+}
+
+func (kv *KVServer) readSnapshotPersist(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot == nil {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var storage map[string]string
+	var lastApplyRequestId map[int64]int
+	if d.Decode(&storage) != nil || d.Decode(&lastApplyRequestId) != nil {
+	} else {
+		kv.storage = storage
+		kv.lastApplyRequestId = lastApplyRequestId
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -198,20 +233,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.waitTime = 500 * time.Millisecond
-
 	kv.storage = make(map[string]string)
 	kv.lastApplyRequestId = make(map[int64]int)
 	kv.dispatcher = make(map[int]chan Notification)
-
-	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.readSnapshotPersist(kv.persister.ReadSnapshot())
+
 	go func() {
 		for applyMsg := range kv.applyCh {
+			if applyMsg.CommandValid == false && applyMsg.Command.(string) == "InstallSnapshot" {
+				data := applyMsg.CommandData
+				kv.readSnapshotPersist(data)
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			kv.mu.Lock()
-
 			if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
 				kv.mu.Unlock()
 				continue
@@ -232,9 +270,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				ch <- notify
 			}
 			kv.mu.Unlock()
+			kv.saveSnapshot(applyMsg.CommandIndex)
 		}
 	}()
 	// You may need initialization code here.
-
 	return kv
 }
